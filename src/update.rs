@@ -1,7 +1,7 @@
 use git_url_parse::GitUrl;
 use std::{env::current_dir, fs, path::PathBuf, str::FromStr};
 use structopt::StructOpt;
-use toml_edit::{decorated, Document, InlineTable};
+use toml_edit::{Document, Item, TableLike, Value};
 use walkdir::{DirEntry, WalkDir};
 
 /// Which dependencies should be rewritten?
@@ -135,10 +135,21 @@ impl Update {
     }
 }
 
+fn get_or_insert(table: &mut dyn TableLike, key: &str, value: Value) {
+    match table.get_mut(key).map(|v| v.as_value_mut()).flatten() {
+        Some(v) => {
+            *v = value;
+        }
+        None => {
+            table.insert(key, Item::Value(value));
+        }
+    }
+}
+
 /// Handle a given dependency.
 ///
 /// This directly modifies the given `dep` in the requested way.
-fn handle_dependency(name: &str, dep: &mut InlineTable, rewrite: &Rewrite, version: &Version) {
+fn handle_dependency(name: &str, dep: &mut dyn TableLike, rewrite: &Rewrite, version: &Version) {
     let git = if let Some(git) = dep
         .get("git")
         .and_then(|v| v.as_str())
@@ -159,7 +170,16 @@ fn handle_dependency(name: &str, dep: &mut InlineTable, rewrite: &Rewrite, versi
     };
 
     if let Some(new_git) = new_git {
-        *dep.get_or_insert("git", "") = decorated(new_git.as_str().into(), " ", "");
+        let new_value = Value::from(new_git.as_str()).decorated(" ", "");
+        match dep.get_mut("git").map(|v| v.as_value_mut()).flatten() {
+            Some(v) => {
+                *v = new_value;
+            }
+            None => {
+                dep.insert("git", Item::Value(new_value));
+            }
+        }
+        get_or_insert(dep, "git", Value::from(new_git.as_str()).decorated(" ", ""));
     }
 
     dep.remove("tag");
@@ -168,13 +188,17 @@ fn handle_dependency(name: &str, dep: &mut InlineTable, rewrite: &Rewrite, versi
 
     match version {
         Version::Tag(tag) => {
-            *dep.get_or_insert(" tag", "") = decorated(tag.as_str().into(), " ", " ");
+            get_or_insert(dep, "tag", Value::from(tag.as_str()).decorated(" ", " "));
         }
         Version::Branch(branch) => {
-            *dep.get_or_insert(" branch", "") = decorated(branch.as_str().into(), " ", " ");
+            get_or_insert(
+                dep,
+                "branch",
+                Value::from(branch.as_str()).decorated(" ", " "),
+            );
         }
         Version::Rev(rev) => {
-            *dep.get_or_insert(" rev", "") = decorated(rev.as_str().into(), " ", " ");
+            get_or_insert(dep, "rev", Value::from(rev.as_str()).decorated(" ", " "));
         }
     }
     log::debug!("  updated: {:?} <= {}", version, name);
@@ -196,21 +220,25 @@ fn handle_toml_file(path: PathBuf, rewrite: &Rewrite, version: &Version) -> Resu
         .clone()
         .iter()
         // filter out everything that is not a dependency table
-        .filter(|(k, _)| k.contains("dependencies"))
+        .filter(|(k, t)| {
+            dbg!(k);
+            k.contains("dependencies")
+                || k.contains("workspace") && dbg!(t).get("dependencies").is_some()
+        })
         .filter_map(|(k, v)| v.as_table().map(|t| (k, t)))
         .for_each(|(k, t)| {
             t.iter()
                 // Filter everything that is not an inline table (`{ foo = bar }`)
-                .filter_map(|v| v.1.as_inline_table().map(|_| v.0))
+                .filter_map(|v| v.1.as_table_like().map(|_| v.0))
                 .for_each(|dn| {
                     // Get the actual inline table from the document that we modify
                     let table = toml_doc[k][dn]
-                        .as_inline_table_mut()
+                        .as_table_like_mut()
                         .expect("We filter by `is_inline_table`; qed");
                     handle_dependency(dn, table, rewrite, version);
                 })
         });
 
-    fs::write(&path, toml_doc.to_string_in_original_order())
+    fs::write(&path, toml_doc.to_string())
         .map_err(|e| format!("Failed to write to `{}`: {:?}", path.display(), e))
 }

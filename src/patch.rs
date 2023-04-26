@@ -1,11 +1,12 @@
 use std::{
+    collections::HashSet,
     env::current_dir,
     fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
 use structopt::StructOpt;
-use toml_edit::{decorated, Document, Item, Value};
+use toml_edit::{Document, Item, Value};
 
 enum PatchTarget {
     Crates,
@@ -49,8 +50,8 @@ impl PatchTarget {
     fn as_string(&self) -> String {
         match self {
             Self::Crates => "crates-io".into(),
-            Self::Git(url) => format!("\"{}\"", url),
-            Self::Custom(custom) => format!("\"{}\"", custom),
+            Self::Git(url) => format!("{}", url),
+            Self::Custom(custom) => format!("{}", custom),
         }
     }
 }
@@ -180,7 +181,7 @@ impl Patch {
         add_patches_for_packages(
             &cargo_toml_to_patch,
             &patch_target,
-            workspace_packages(&self.crates_to_patch)?,
+            workspace_packages(&self.crates_to_patch, &path)?,
             point_to,
         )
     }
@@ -235,6 +236,7 @@ fn workspace_root_package(path: &Path) -> Result<PathBuf, String> {
 /// Returns all package names of the given `workspace`.
 fn workspace_packages(
     workspace: &Path,
+    patched_workspace: &Path,
 ) -> Result<impl Iterator<Item = cargo_metadata::Package>, String> {
     let metadata = cargo_metadata::MetadataCommand::new()
         .current_dir(workspace)
@@ -247,11 +249,28 @@ fn workspace_packages(
             )
         })?;
 
+    let patched_metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(patched_workspace)
+        .exec()
+        .map_err(|e| {
+            format!(
+                "Failed to get cargo metadata for workspace `{}`: {:?}",
+                workspace.display(),
+                e
+            )
+        })?;
+    let referenced_packages: HashSet<String> = patched_metadata
+        .packages
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+
     Ok(metadata
         .workspace_members
         .clone()
         .into_iter()
-        .map(move |p| metadata[&p].clone()))
+        .map(move |p| metadata[&p].clone())
+        .filter(move |p| referenced_packages.contains(&p.name)))
 }
 
 fn add_patches_for_packages(
@@ -306,20 +325,23 @@ fn add_patches_for_packages(
         match &point_to {
             PointTo::Path => {
                 *patch.get_or_insert("path", "") =
-                    decorated(path.display().to_string().into(), " ", " ");
+                    Value::from(path.display().to_string()).decorated(" ", " ");
             }
             PointTo::GitBranch { repository, branch } => {
-                *patch.get_or_insert("git", "") = decorated(repository.clone().into(), " ", " ");
-                *patch.get_or_insert("branch", "") = decorated(branch.clone().into(), " ", " ");
+                *patch.get_or_insert("git", "") =
+                    Value::from(repository.clone()).decorated(" ", " ");
+                *patch.get_or_insert("branch", "") =
+                    Value::from(branch.clone()).decorated(" ", " ");
             }
             PointTo::GitCommit { repository, commit } => {
-                *patch.get_or_insert("git", "") = decorated(repository.clone().into(), " ", " ");
-                *patch.get_or_insert("rev", "") = decorated(commit.clone().into(), " ", " ");
+                *patch.get_or_insert("git", "") =
+                    Value::from(repository.clone()).decorated(" ", " ");
+                *patch.get_or_insert("rev", "") = Value::from(commit.clone()).decorated(" ", " ");
             }
         }
         Ok::<_, String>(())
     })?;
 
-    fs::write(&cargo_toml, doc.to_string_in_original_order())
+    fs::write(&cargo_toml, doc.to_string())
         .map_err(|e| format!("Failed to write to `{}`: {:?}", cargo_toml.display(), e))
 }
